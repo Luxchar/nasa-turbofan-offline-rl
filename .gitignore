@@ -1,0 +1,52 @@
+# Environment
+venv/
+env/
+ENV/
+.venv
+.env
+*.egg-info/
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+.jupyter/*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+*.lnk
+
+# Data & Models
+*.pkl
+*.pickle
+*.h5
+*.pth
+*.joblib
+.cache/
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
