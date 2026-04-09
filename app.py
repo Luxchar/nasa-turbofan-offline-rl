@@ -117,6 +117,8 @@ class TabularQLearning:
         Returns:
             actions: (N,) array of actions
         """
+        # Ensure correct dtype
+        sensor_data = np.asarray(sensor_data, dtype=np.float64)
         # Apply scaler
         scaled = self.scaler.transform(sensor_data)
         # Apply PCA
@@ -127,7 +129,7 @@ class TabularQLearning:
         # Discretize to states
         states = (health_norm * (self.n_states - 1)).astype(int).clip(0, self.n_states - 1)
         # Get Q-values
-        Q_vals = self.Q[states]
+        Q_vals = self.Q[states].astype(np.float64)
         return Q_vals
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -265,7 +267,8 @@ if not loaded_models:
 tabs = st.tabs([
     "📊 Comparaison de Stratégie", 
     "🤖 Comparaison 3 Modèles",
-    "🔍 Q-Values Inspection",
+    "� Monitoring Moteur",
+    "�🔍 Q-Values Inspection",
     "🎬 Policy Rollout",
     "📈 Performance Test",
     "⚡ Hyperparamètres",
@@ -461,10 +464,235 @@ with tabs[1]:
         st.info("📌 Chargez au moins un modèle Q-Learning et un modèle DQN pour comparer.")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TAB 3: Q-VALUES INSPECTION
+# TAB 3: MONITORING ENGINE HEALTH
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 with tabs[2]:
+    st.subheader("📡 Monitoring Temps Réel — Score de Santé Moteur")
+    
+    # Select engine to monitor
+    engine_monitor_id = st.selectbox("Sélectionner moteur de test:", 
+                                      sorted(test_data['unit'].unique()),
+                                      key="monitor_engine")
+    
+    # Get all cycles for this engine
+    engine_monitor = test_data[test_data['unit'] == engine_monitor_id].reset_index(drop=True)
+    
+    if len(engine_monitor) == 0:
+        st.error("Moteur non trouvé.")
+    else:
+        # Slider for cycle
+        max_cycle_idx = len(engine_monitor) - 1
+        cycle_idx = st.slider("Sélectionner cycle:", 
+                              min_value=0, 
+                              max_value=max_cycle_idx,
+                              value=max_cycle_idx,
+                              step=1)
+        
+        engine_state = engine_monitor.iloc[cycle_idx]
+        
+        # Get sensor data at this cycle - convert to float explicitly
+        sensor_values = engine_state[LIVE_SENSORS].values.astype(np.float32).reshape(1, -1)
+        true_rul = engine_state['true_RUL']
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # CALCULATE HEALTH SCORES FOR ALL MODELS
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        health_scores = {}
+        
+        for model_label, (model_type, model, _) in loaded_models.items():
+            if model_type == "DQN":
+                # For DQN: high Q(continue) = healthy, high Q(flag) = unhealthy
+                states_t = torch.tensor(sensor_values, dtype=torch.float32).to(DEVICE)
+                with torch.no_grad():
+                    q_vals = model(states_t).cpu().numpy()[0]
+                
+                q_continue, q_flag = q_vals[0], q_vals[1]
+                # Normalize to 0-100: higher Q(continue) = healthier
+                health_score = 50 + 50 * (q_continue - q_flag) / (abs(q_continue) + abs(q_flag) + 1e-6)
+                health_score = max(0, min(100, health_score))
+                
+            else:  # QL model
+                # For QL: get Q-values and calculate health
+                q_vals = model.predict(sensor_values)[0]
+                q_continue, q_flag = q_vals[0], q_vals[1]
+                # Normalize to 0-100
+                health_score = 50 + 50 * (q_continue - q_flag) / (abs(q_continue) + abs(q_flag) + 1e-6)
+                health_score = max(0, min(100, health_score))
+            
+            health_scores[model_label] = health_score
+        
+        # Also calculate health from actual RUL (ground truth)
+        rul_health = max(0, min(100, (true_rul / RUL_CAP) * 100))
+        health_scores["Réel (RUL)"] = rul_health
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DISPLAY: Current state info
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Cycle", f"{int(engine_state['cycle'])}")
+        with col2:
+            st.metric("RUL Réel", f"{true_rul:.1f} cycles")
+        with col3:
+            status = "🟢 BON" if true_rul > FLAG_THRESHOLD else "🔴 CRITIQUE"
+            st.metric("Statut", status)
+        
+        st.markdown("---")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DISPLAY: Health scores with gauges
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        st.subheader("💚 Score de Santé (0-100)")
+        
+        cols = st.columns(len(health_scores))
+        
+        for idx, (model_name, score) in enumerate(health_scores.items()):
+            with cols[idx]:
+                # Color based on health
+                if score >= 70:
+                    color = "green"
+                    emoji = "🟢"
+                elif score >= 40:
+                    color = "orange"
+                    emoji = "🟡"
+                else:
+                    color = "red"
+                    emoji = "🔴"
+                
+                # Create progress bar visualization
+                st.markdown(f"### {model_name}")
+                st.markdown(f"{emoji} **{score:.1f}**")
+                
+                # Custom progress bar
+                progress_html = f"""
+                <div style="width: 100%; height: 30px; background-color: #e0e0e0; border-radius: 15px; overflow: hidden;">
+                    <div style="width: {score}%; height: 100%; background-color: {color}; transition: width 0.3s;">
+                    </div>
+                </div>
+                """
+                st.markdown(progress_html, unsafe_allow_html=True)
+                
+                # Interpretation
+                if score >= 70:
+                    interpretation = "✅ Moteur sain"
+                elif score >= 40:
+                    interpretation = "⚠️ À surveiller"
+                else:
+                    interpretation = "🚨 Maintenance requise"
+                
+                st.caption(interpretation)
+        
+        st.markdown("---")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DISPLAY: Real-time sensor data
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        st.subheader("📊 Données Capteurs en Temps Réel")
+        
+        sensor_data_dict = {
+            'Capteur': LIVE_SENSORS,
+            'Valeur': engine_state[LIVE_SENSORS].values,
+            'Min': [test_data[s].min() for s in LIVE_SENSORS],
+            'Max': [test_data[s].max() for s in LIVE_SENSORS],
+        }
+        
+        sensor_df = pd.DataFrame(sensor_data_dict)
+        sensor_df['Valeur'] = sensor_df['Valeur'].round(3)
+        sensor_df['Min'] = sensor_df['Min'].round(3)
+        sensor_df['Max'] = sensor_df['Max'].round(3)
+        
+        st.dataframe(sensor_df, use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DISPLAY: Comparison chart
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        st.subheader("📈 Comparaison des Scores")
+        
+        fig, ax = plt.subplots(figsize=(12, 5))
+        
+        model_names = list(health_scores.keys())
+        scores = list(health_scores.values())
+        colors_list = ['green' if s >= 70 else 'orange' if s >= 40 else 'red' for s in scores]
+        
+        bars = ax.barh(model_names, scores, color=colors_list, alpha=0.8)
+        ax.axvline(40, color='red', linestyle='--', linewidth=2, label='Seuil maintenance (40%)')
+        ax.set_xlabel('Score de Santé (0-100)', fontsize=12)
+        ax.set_title(f'Engine {engine_monitor_id} — Cycle {int(engine_state["cycle"])}', fontsize=13, fontweight='bold')
+        ax.set_xlim(0, 100)
+        ax.grid(True, axis='x', alpha=0.3)
+        
+        # Add value labels
+        for i, (bar, score) in enumerate(zip(bars, scores)):
+            ax.text(score + 2, i, f'{score:.1f}', va='center', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # DISPLAY: Trajectory over time
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        st.subheader("📍 Évolution de la Santé (sur tous les cycles)")
+        
+        # Calculate health scores for all cycles
+        health_trajectory = {label: [] for label in loaded_models.keys()}
+        health_trajectory["Réel (RUL)"] = []
+        
+        for idx in range(len(engine_monitor)):
+            cycle_data = engine_monitor.iloc[idx][LIVE_SENSORS].values.astype(np.float32).reshape(1, -1)
+            cycle_rul = engine_monitor.iloc[idx]['true_RUL']
+            
+            # Calculate for each model
+            for model_label, (model_type, model, _) in loaded_models.items():
+                if model_type == "DQN":
+                    states_t = torch.tensor(cycle_data, dtype=torch.float32).to(DEVICE)
+                    with torch.no_grad():
+                        q_vals = model(states_t).cpu().numpy()[0]
+                else:
+                    q_vals = model.predict(cycle_data)[0]
+                
+                score = 50 + 50 * (q_vals[0] - q_vals[1]) / (abs(q_vals[0]) + abs(q_vals[1]) + 1e-6)
+                health_trajectory[model_label].append(max(0, min(100, score)))
+            
+            # Actual health from RUL
+            health_trajectory["Réel (RUL)"].append(max(0, min(100, (cycle_rul / RUL_CAP) * 100)))
+        
+        fig, ax = plt.subplots(figsize=(14, 6))
+        
+        cycles = engine_monitor['cycle'].values
+        for label, scores_traj in health_trajectory.items():
+            ax.plot(cycles, scores_traj, marker='o', label=label, linewidth=2, markersize=4, alpha=0.8)
+        
+        ax.axhline(70, color='green', linestyle=':', alpha=0.5, label='Sain (70%)')
+        ax.axhline(40, color='orange', linestyle=':', alpha=0.5, label='Attention (40%)')
+        ax.fill_between(cycles, 0, 40, alpha=0.1, color='red')
+        ax.fill_between(cycles, 40, 70, alpha=0.1, color='orange')
+        ax.fill_between(cycles, 70, 100, alpha=0.1, color='green')
+        
+        ax.set_xlabel('Cycle', fontsize=11)
+        ax.set_ylabel('Score de Santé (0-100)', fontsize=11)
+        ax.set_title(f'Évolution du Score de Santé — Engine {engine_monitor_id}', fontsize=12, fontweight='bold')
+        ax.set_ylim(0, 105)
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 4: Q-VALUES INSPECTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tabs[3]:
     st.subheader("🔍 Inspection des Q-Values")
     
     # Select model to inspect
@@ -537,10 +765,10 @@ with tabs[2]:
             st.metric("Policy: Flag actions", f"{(pred_actions == 1).sum()} / {len(pred_actions)}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TAB 4: POLICY ROLLOUT
+# TAB 5: POLICY ROLLOUT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("🎬 Policy Rollout sur Test Set")
     
     model_to_rollout = st.selectbox("Sélectionner modèle pour rollout:", list(loaded_models.keys()), key="rollout_model")
@@ -586,10 +814,11 @@ with tabs[3]:
             st.pyplot(fig, use_container_width=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TAB 5: PERFORMANCE TEST
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 6: PERFORMANCE TEST
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("📈 Performance sur Test Set")
     
     col1, col2 = st.columns(2)
@@ -645,10 +874,11 @@ with tabs[4]:
             ))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TAB 6: HYPERPARAMETERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 7: HYPERPARAMETERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("⚡ Hyperparamètres et Configuration")
     
     col1, col2 = st.columns(2)
@@ -701,10 +931,10 @@ with tabs[5]:
     st.dataframe(df_strategy, use_container_width=True, hide_index=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TAB 7: DETAILED ANALYSIS
+# TAB 8: DETAILED ANALYSIS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("📋 Analyse Détaillée des Optimisations")
     
     st.markdown("### 1️⃣ Split Train/Validation")
